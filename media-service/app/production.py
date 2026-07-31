@@ -75,16 +75,35 @@ def _tts(text: str, voice: str, delivery: str, output: Path) -> None:
             },
         },
     }
+    max_retries = max(6, int(os.environ.get("GEMINI_TTS_MAX_RETRIES", "12")))
+    maximum_wait = max(60, int(os.environ.get("GEMINI_TTS_MAX_RETRY_WAIT_SECONDS", "120")))
     with httpx.Client(timeout=180) as client:
-        for attempt in range(6):
+        for attempt in range(max_retries):
             response = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
             if response.status_code not in (429, 500, 502, 503, 504):
                 response.raise_for_status()
                 break
-            if attempt == 5:
+            if attempt == max_retries - 1:
                 response.raise_for_status()
-            retry_after = int(response.headers.get("retry-after", "0") or 0)
-            time.sleep(max(retry_after, min(60, 5 * (2**attempt))))
+
+            retry_after = 0
+            try:
+                retry_after = int(float(response.headers.get("retry-after", "0") or 0))
+            except (TypeError, ValueError):
+                retry_after = 0
+
+            # Gemini may return google.rpc.RetryInfo in the JSON body.
+            try:
+                details = response.json().get("error", {}).get("details", [])
+                for detail in details:
+                    delay = str(detail.get("retryDelay", "")).rstrip("s")
+                    if delay:
+                        retry_after = max(retry_after, int(float(delay)))
+            except (TypeError, ValueError, KeyError):
+                pass
+
+            exponential_wait = min(maximum_wait, 15 * (2**attempt))
+            time.sleep(max(retry_after, exponential_wait))
         data = response.json()
     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
     inline = next((p.get("inlineData") or p.get("inline_data") for p in parts if p.get("inlineData") or p.get("inline_data")), None)
@@ -154,11 +173,17 @@ def produce(job: dict[str, Any], job_dir: Path, public_base: str) -> dict[str, A
         directory.mkdir(parents=True, exist_ok=True)
 
     speakers = {s["speaker_id"]: s for s in documentary.get("speakers", [])}
+    tts_interval = max(0.0, float(os.environ.get("GEMINI_TTS_INTERVAL_SECONDS", "10")))
     for index, turn in enumerate(turns, 1):
         speaker = speakers.get(turn["speaker_id"], {})
         voice = speaker.get("voice_name") or {"SPEAKER_A": "Kore", "SPEAKER_B": "Charon", "SPEAKER_C": "Puck"}[turn["speaker_id"]]
-        _tts(turn["text"], voice, turn.get("delivery", "calm_documentary"), audio_dir / f"{index:03d}-{turn['speaker_id']}.wav")
+        audio_path = audio_dir / f"{index:03d}-{turn['speaker_id']}.wav"
+        # Keep completed turns inside the current job and never request them twice.
+        if not audio_path.exists() or audio_path.stat().st_size < 44:
+            _tts(turn["text"], voice, turn.get("delivery", "calm_documentary"), audio_path)
         job.update(progress=5 + int(index / len(turns) * 45), message=f"TTS {index}/{len(turns)}")
+        if index < len(turns) and tts_interval:
+            time.sleep(tts_interval)
 
     narration = output_dir / "narration.wav"
     planned_duration = sum(max(4.0, float(scene.get("duration_seconds", 4))) for scene in scenes)
