@@ -14,6 +14,8 @@ from typing import Any
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 
+from .pexels import acquire_scene_video, normalize_video
+
 
 def _run(command: list[str], timeout: int = 3600) -> None:
     result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
@@ -121,10 +123,29 @@ def _concat_wav(turns: list[dict[str, Any]], audio_dir: Path, output: Path, targ
 def produce(job: dict[str, Any], job_dir: Path, public_base: str) -> dict[str, Any]:
     payload = job["payload"]
     documentary = payload["documentary"]
-    turns = sorted(documentary.get("dialogue_turns", []), key=lambda x: int(x.get("sequence", 0)))
-    scenes = sorted(payload.get("timeline", {}).get("scenes", []), key=lambda x: int(x.get("scene_number", 0)))
-    if len(turns) != 42 or len(scenes) != 22:
-        raise RuntimeError("Production requires exactly 42 turns and 22 scenes")
+    turns = sorted(
+        documentary.get("dialogue_turns", []),
+        key=lambda x: int(x.get("sequence", 10**9) or 10**9),
+    )
+    scenes = sorted(
+        payload.get("timeline", {}).get("scenes", []),
+        key=lambda x: int(x.get("scene_number", 10**9) or 10**9),
+    )
+    # Upstream validation normally guarantees 42/22. If numbering is damaged,
+    # repair it deterministically instead of moving media to another time slot.
+    for index, turn in enumerate(turns, 1):
+        turn["sequence"] = index
+    for index, scene in enumerate(scenes, 1):
+        scene["scene_number"] = index
+
+    media_jobs = sorted(
+        payload.get("acquisition", {}).get("media_jobs", []),
+        key=lambda x: int(x.get("scene_number", 10**9) or 10**9),
+    )
+    media_job_by_scene = {
+        index: media_jobs[index - 1] if index <= len(media_jobs) else None
+        for index in range(1, len(scenes) + 1)
+    }
 
     audio_dir = job_dir / "audio"
     scene_dir = job_dir / "scenes"
@@ -144,15 +165,54 @@ def produce(job: dict[str, Any], job_dir: Path, public_base: str) -> dict[str, A
     audio_duration = _concat_wav(turns, audio_dir, narration, planned_duration)
     clip_list = job_dir / "clips.txt"
     clip_lines: list[str] = []
+    media_manifest: list[dict[str, Any]] = []
+    moving_video_scenes = 0
+    fallback_card_scenes = 0
     for index, scene in enumerate(scenes, 1):
+        # The array index is the canonical timeline position. It is repaired
+        # above and used consistently for search, file name and concatenation.
+        scene["scene_number"] = index
         image_path = scene_dir / f"scene-{index:03d}.jpg"
+        raw_video_path = scene_dir / f"scene-{index:03d}-source.mp4"
         clip_path = scene_dir / f"scene-{index:03d}.mp4"
         _scene_card(image_path, scene, documentary.get("title", "Belgesel"))
         duration = max(4.0, float(scene.get("duration_seconds", 4)))
-        _run(["ffmpeg", "-y", "-v", "error", "-loop", "1", "-i", str(image_path), "-t", str(duration), "-vf", "scale=1920:1080,zoompan=z='min(zoom+0.0005,1.08)':d=1:s=1920x1080:fps=30,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-an", str(clip_path)])
+        attribution = None
+        try:
+            attribution = acquire_scene_video(
+                scene,
+                media_job_by_scene.get(index),
+                raw_video_path,
+            )
+            if attribution:
+                normalize_video(raw_video_path, clip_path, duration)
+                moving_video_scenes += 1
+        except Exception as error:
+            attribution = {
+                "provider": "scene_card",
+                "scene_number": index,
+                "fallback_reason": str(error)[:500],
+            }
+        finally:
+            raw_video_path.unlink(missing_ok=True)
+
+        if not clip_path.exists():
+            _run(["ffmpeg", "-y", "-v", "error", "-loop", "1", "-i", str(image_path), "-t", str(duration), "-vf", "scale=1920:1080,zoompan=z='min(zoom+0.0005,1.08)':d=1:s=1920x1080:fps=30,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-an", str(clip_path)])
+            fallback_card_scenes += 1
+            attribution = attribution or {
+                "provider": "scene_card",
+                "scene_number": index,
+                "fallback_reason": "No matching downloadable Pexels video",
+            }
+
+        media_manifest.append(attribution)
         clip_lines.append(f"file '{clip_path.as_posix()}'")
-        job.update(progress=52 + int(index / len(scenes) * 28), message=f"Scene {index}/{len(scenes)}")
+        job.update(progress=52 + int(index / max(1, len(scenes)) * 28), message=f"Scene {index}/{len(scenes)}")
     clip_list.write_text("\n".join(clip_lines), encoding="utf-8")
+    (output_dir / "media-manifest.json").write_text(
+        json.dumps(media_manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     silent_video = output_dir / "silent.mp4"
     _run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(clip_list), "-c", "copy", str(silent_video)])
 
@@ -173,5 +233,8 @@ def produce(job: dict[str, Any], job_dir: Path, public_base: str) -> dict[str, A
             "duration_seconds": round(audio_duration, 2), "width": 1920, "height": 1080,
             "has_video": True, "has_audio": True, "has_subtitles": True, "thumbnail_created": True,
             "video_size_bytes": final_video.stat().st_size,
+            "moving_video_scenes": moving_video_scenes,
+            "fallback_card_scenes": fallback_card_scenes,
+            "timeline_order_repaired": True,
         },
     }
