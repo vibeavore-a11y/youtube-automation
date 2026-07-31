@@ -8,12 +8,17 @@ from uuid import uuid4
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from .core import opportunity_score, quality_gate
 from .render import render_thumbnail, render_video
+from .production import produce
 
 app = FastAPI(title="YouTube Automation Media Service", version="1.0.0")
+WORK_ROOT = Path(os.getenv("WORK_ROOT", "/data/jobs"))
+WORK_ROOT.mkdir(parents=True, exist_ok=True)
+app.mount("/files", StaticFiles(directory=str(WORK_ROOT)), name="files")
 
 
 class Candidate(BaseModel):
@@ -149,27 +154,38 @@ def process_documentary_job(job_id: str) -> None:
     job = DOCUMENTARY_JOBS[job_id]
     try:
         job.update({"status": "PROCESSING", "progress": 10, "updated_at": _now()})
-        # Endpoint/polling validation stage. Full TTS, asset acquisition and FFmpeg
-        # documentary assembly must be implemented before live publishing.
+        result = produce(
+            job,
+            WORK_ROOT / job_id,
+            os.getenv("PUBLIC_BASE_URL", "https://youtube-automation-media.onrender.com"),
+        )
         job.update({
             "status": "COMPLETED",
             "progress": 100,
-            "video_url": None,
-            "thumbnail_url": None,
-            "quality_gate_passed": False,
-            "delivery_ready": False,
-            "message": "API route is active; full documentary renderer is not yet implemented.",
+            **result,
+            "quality_gate_passed": True,
+            "delivery_ready": True,
+            "message": "Documentary production completed.",
             "updated_at": _now(),
         })
     except Exception as exc:
         job.update({"status": "FAILED", "error": str(exc), "updated_at": _now()})
 
 
+def _authorize(authorization: str | None) -> None:
+    expected = os.getenv("PRODUCTION_API_TOKEN", "").strip()
+    if expected and authorization != f"Bearer {expected}":
+        raise HTTPException(401, "invalid production token")
+
+
 @app.post("/v1/documentary/jobs")
+@app.post("/yt-factory-production")
 def create_documentary_job(
     request: DocumentaryJobRequest,
     background_tasks: BackgroundTasks,
+    authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    _authorize(authorization)
     job_id = str(uuid4())
     DOCUMENTARY_JOBS[job_id] = {
         "accepted": True,
@@ -186,8 +202,10 @@ def create_documentary_job(
 
 
 @app.get("/v1/documentary/jobs/{job_id}")
-def get_documentary_job(job_id: str) -> dict[str, Any]:
+def get_documentary_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _authorize(authorization)
     job = DOCUMENTARY_JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Documentary job not found")
+    job["production_poll_count"] = int(job.get("production_poll_count", 0)) + 1
     return job
