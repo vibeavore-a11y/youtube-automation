@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from uuid import uuid4
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from .core import opportunity_score, quality_gate
@@ -144,10 +145,63 @@ class DocumentaryJobRequest(BaseModel):
 
 
 DOCUMENTARY_JOBS: dict[str, dict[str, Any]] = {}
+RUNNING_JOB_IDS: set[str] = set()
+RUNNING_JOB_LOCK = threading.Lock()
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class PersistentJob(dict[str, Any]):
+    """Dictionary-compatible job state with an atomic on-disk checkpoint."""
+
+    def __init__(self, job_id: str, initial: dict[str, Any] | None = None) -> None:
+        self.job_id = job_id
+        self.state_path = WORK_ROOT / job_id / "job-state.json"
+        self._lock = threading.RLock()
+        super().__init__(initial or {})
+
+    def checkpoint(self) -> None:
+        with self._lock:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.state_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(dict(self), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            temporary.replace(self.state_path)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        with self._lock:
+            super().update(*args, **kwargs)
+            if "updated_at" not in kwargs:
+                super().__setitem__("updated_at", _now())
+            self.checkpoint()
+
+
+def _load_persisted_jobs() -> None:
+    for state_path in WORK_ROOT.glob("*/job-state.json"):
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            job_id = str(state.get("job_id") or state_path.parent.name)
+            DOCUMENTARY_JOBS[job_id] = PersistentJob(job_id, state)
+        except (OSError, ValueError, TypeError):
+            continue
+
+
+def _start_documentary_job(job_id: str) -> bool:
+    with RUNNING_JOB_LOCK:
+        if job_id in RUNNING_JOB_IDS:
+            return False
+        RUNNING_JOB_IDS.add(job_id)
+    threading.Thread(
+        target=process_documentary_job,
+        args=(job_id,),
+        name=f"documentary-{job_id[:8]}",
+        daemon=True,
+    ).start()
+    return True
 
 
 def process_documentary_job(job_id: str) -> None:
@@ -170,6 +224,21 @@ def process_documentary_job(job_id: str) -> None:
         })
     except Exception as exc:
         job.update({"status": "FAILED", "error": str(exc), "updated_at": _now()})
+    finally:
+        with RUNNING_JOB_LOCK:
+            RUNNING_JOB_IDS.discard(job_id)
+
+
+@app.on_event("startup")
+def resume_documentary_jobs() -> None:
+    _load_persisted_jobs()
+    for job_id, job in list(DOCUMENTARY_JOBS.items()):
+        if str(job.get("status", "")).upper() in {"QUEUED", "PROCESSING"}:
+            job.update(
+                status="QUEUED",
+                message="Service restarted; resuming from the latest checkpoint.",
+            )
+            _start_documentary_job(job_id)
 
 
 def _authorize(authorization: str | None) -> None:
@@ -182,12 +251,11 @@ def _authorize(authorization: str | None) -> None:
 @app.post("/yt-factory-production")
 def create_documentary_job(
     request: DocumentaryJobRequest,
-    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     _authorize(authorization)
     job_id = str(uuid4())
-    DOCUMENTARY_JOBS[job_id] = {
+    job = PersistentJob(job_id, {
         "accepted": True,
         "job_id": job_id,
         "request_id": request.request_id,
@@ -196,8 +264,10 @@ def create_documentary_job(
         "payload": request.model_dump(),
         "created_at": _now(),
         "updated_at": _now(),
-    }
-    background_tasks.add_task(process_documentary_job, job_id)
+    })
+    DOCUMENTARY_JOBS[job_id] = job
+    job.checkpoint()
+    _start_documentary_job(job_id)
     return {"accepted": True, "job_id": job_id, "status": "QUEUED"}
 
 
@@ -207,5 +277,19 @@ def get_documentary_job(job_id: str, authorization: str | None = Header(default=
     job = DOCUMENTARY_JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Documentary job not found")
-    job["production_poll_count"] = int(job.get("production_poll_count", 0)) + 1
-    return job
+    # A live thread is authoritative. If a restart occurred, the startup hook
+    # reloads the checkpoint and resumes without creating a second job ID.
+    dict.__setitem__(
+        job,
+        "production_poll_count",
+        int(job.get("production_poll_count", 0)) + 1,
+    )
+    if isinstance(job, PersistentJob):
+        job.checkpoint()
+    if str(job.get("status", "")).upper() in {"QUEUED", "PROCESSING"}:
+        with RUNNING_JOB_LOCK:
+            is_running = job_id in RUNNING_JOB_IDS
+        if not is_running:
+            job.update(message="Watchdog resumed an interrupted production job.")
+            _start_documentary_job(job_id)
+    return dict(job)
