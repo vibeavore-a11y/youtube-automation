@@ -9,7 +9,7 @@ import textwrap
 import time
 import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
@@ -58,7 +58,27 @@ def _write_wav(path: Path, pcm: bytes, rate: int = 24000) -> None:
         wf.writeframes(pcm)
 
 
-def _tts(text: str, voice: str, delivery: str, output: Path) -> None:
+def _heartbeat_sleep(
+    seconds: float,
+    heartbeat: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    remaining = max(0.0, seconds)
+    while remaining > 0:
+        if heartbeat:
+            heartbeat(message)
+        step = min(15.0, remaining)
+        time.sleep(step)
+        remaining -= step
+
+
+def _tts(
+    text: str,
+    voice: str,
+    delivery: str,
+    output: Path,
+    heartbeat: Callable[[str], None] | None = None,
+) -> None:
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is required by the media service")
@@ -79,6 +99,8 @@ def _tts(text: str, voice: str, delivery: str, output: Path) -> None:
     maximum_wait = max(60, int(os.environ.get("GEMINI_TTS_MAX_RETRY_WAIT_SECONDS", "120")))
     with httpx.Client(timeout=180) as client:
         for attempt in range(max_retries):
+            if heartbeat:
+                heartbeat(f"Gemini TTS request attempt {attempt + 1}/{max_retries}")
             response = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
             if response.status_code not in (429, 500, 502, 503, 504):
                 response.raise_for_status()
@@ -103,7 +125,12 @@ def _tts(text: str, voice: str, delivery: str, output: Path) -> None:
                 pass
 
             exponential_wait = min(maximum_wait, 15 * (2**attempt))
-            time.sleep(max(retry_after, exponential_wait))
+            wait_seconds = max(retry_after, exponential_wait)
+            _heartbeat_sleep(
+                wait_seconds,
+                heartbeat,
+                f"Gemini TTS rate limited; retrying in {int(wait_seconds)} seconds",
+            )
         data = response.json()
     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
     inline = next((p.get("inlineData") or p.get("inline_data") for p in parts if p.get("inlineData") or p.get("inline_data")), None)
@@ -178,12 +205,26 @@ def produce(job: dict[str, Any], job_dir: Path, public_base: str) -> dict[str, A
         speaker = speakers.get(turn["speaker_id"], {})
         voice = speaker.get("voice_name") or {"SPEAKER_A": "Kore", "SPEAKER_B": "Charon", "SPEAKER_C": "Puck"}[turn["speaker_id"]]
         audio_path = audio_dir / f"{index:03d}-{turn['speaker_id']}.wav"
+        heartbeat = lambda message, turn_index=index: job.update(
+            progress=5 + int((turn_index - 1) / len(turns) * 45),
+            message=f"TTS {turn_index}/{len(turns)} | {message}",
+        )
         # Keep completed turns inside the current job and never request them twice.
         if not audio_path.exists() or audio_path.stat().st_size < 44:
-            _tts(turn["text"], voice, turn.get("delivery", "calm_documentary"), audio_path)
+            _tts(
+                turn["text"],
+                voice,
+                turn.get("delivery", "calm_documentary"),
+                audio_path,
+                heartbeat,
+            )
         job.update(progress=5 + int(index / len(turns) * 45), message=f"TTS {index}/{len(turns)}")
         if index < len(turns) and tts_interval:
-            time.sleep(tts_interval)
+            _heartbeat_sleep(
+                tts_interval,
+                heartbeat,
+                f"TTS {index}/{len(turns)} complete; pacing next request",
+            )
 
     narration = output_dir / "narration.wav"
     planned_duration = sum(max(4.0, float(scene.get("duration_seconds", 4))) for scene in scenes)
